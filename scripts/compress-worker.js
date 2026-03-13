@@ -41,7 +41,7 @@ const TEMP_DIR = "/tmp/compress";
 const INPUT_FILE = path.join(TEMP_DIR, "input.mp4");
 const HLS_DIR = path.join(TEMP_DIR, "hls");
 
-const PARALLEL_UPLOADS = 10;
+const PARALLEL_UPLOADS = 15;
 const PARALLEL_DOWNLOAD_CHUNKS = 8;
 const DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB per chunk
 const PROGRESS_INTERVAL = 1000; // 1 second
@@ -253,12 +253,12 @@ async function encodeHLS() {
     "-preset", "medium",
     "-vf", "scale=-2:'min(540,ih)'",
     "-pix_fmt", "yuv420p",
-    "-g", "48",
-    "-keyint_min", "48",
+    "-g", "120",
+    "-keyint_min", "120",
     "-sc_threshold", "0",
     "-c:a", "aac", "-b:a", "128k", "-ac", "2",
     "-f", "hls",
-    "-hls_time", "4",
+    "-hls_time", "10",
     "-hls_playlist_type", "vod",
     "-hls_flags", "independent_segments",
     "-hls_segment_type", "fmp4",
