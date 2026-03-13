@@ -41,7 +41,9 @@ const TEMP_DIR = "/tmp/compress";
 const INPUT_FILE = path.join(TEMP_DIR, "input.mp4");
 const HLS_DIR = path.join(TEMP_DIR, "hls");
 
-const PARALLEL_UPLOADS = 6;
+const PARALLEL_UPLOADS = 10;
+const PARALLEL_DOWNLOAD_CHUNKS = 8;
+const DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB per chunk
 const PROGRESS_INTERVAL = 1000; // 1 second
 
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
@@ -79,63 +81,148 @@ function updateProgress(updates) {
   sendProgress();
 }
 
-// ─── Step 1: Download source video ───────────────────
+// ─── Step 1: Download source video (parallel chunks) ─
 async function download() {
   log(`Downloading from: ${SOURCE_URL.slice(0, 80)}...`);
-  updateProgress({ phase: "downloading", percent: 0, detail: "Starting download..." });
+  updateProgress({ phase: "downloading", percent: 0, detail: "Checking source..." });
 
-  const resp = await axios.get(SOURCE_URL, {
-    responseType: "stream",
-    timeout: 600000,
-    maxRedirects: 5
-  });
+  // HEAD request to get content-length and check Range support
+  let totalBytes = 0;
+  let acceptsRanges = false;
+  try {
+    const head = await axios.head(SOURCE_URL, { timeout: 30000, maxRedirects: 5 });
+    totalBytes = parseInt(head.headers["content-length"] || "0", 10);
+    acceptsRanges = (head.headers["accept-ranges"] || "").toLowerCase() === "bytes";
+  } catch (_) {
+    // HEAD failed — try GET to get content-length
+    const probe = await axios.get(SOURCE_URL, { responseType: "stream", timeout: 30000, maxRedirects: 5 });
+    totalBytes = parseInt(probe.headers["content-length"] || "0", 10);
+    acceptsRanges = (probe.headers["accept-ranges"] || "").toLowerCase() === "bytes";
+    probe.data.destroy();
+  }
 
-  const totalBytes = parseInt(resp.headers["content-length"] || "0", 10);
-  let downloadedBytes = 0;
-  let lastSpeedCheck = Date.now();
-  let lastSpeedBytes = 0;
+  log(`Source: ${(totalBytes / 1024 / 1024).toFixed(1)} MB, Range support: ${acceptsRanges}`);
 
-  const writer = fs.createWriteStream(INPUT_FILE);
-
-  resp.data.on("data", (chunk) => {
-    downloadedBytes += chunk.length;
-
-    const now = Date.now();
-    const elapsed = (now - lastSpeedCheck) / 1000;
-
-    // Update speed calculation every second
-    if (elapsed >= 1) {
-      const bytesInPeriod = downloadedBytes - lastSpeedBytes;
-      const speed = bytesInPeriod / elapsed;
-      const remaining = totalBytes > 0 ? (totalBytes - downloadedBytes) / speed : null;
-      const pct = totalBytes > 0 ? Math.min(99, (downloadedBytes / totalBytes) * 100) : 0;
-
-      updateProgress({
-        phase: "downloading",
-        percent: Math.round(pct * 10) / 10,
-        speed: Math.round(speed),
-        eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
-        detail: `${(downloadedBytes / 1024 / 1024).toFixed(1)} MB / ${totalBytes > 0 ? (totalBytes / 1024 / 1024).toFixed(1) + " MB" : "?"}`
-      });
-
-      lastSpeedCheck = now;
-      lastSpeedBytes = downloadedBytes;
-    }
-  });
-
-  resp.data.pipe(writer);
-
-  await new Promise((resolve, reject) => {
-    writer.on("finish", resolve);
-    writer.on("error", reject);
-    resp.data.on("error", reject);
-  });
+  // Use parallel chunked download if Range is supported and file is large enough
+  if (acceptsRanges && totalBytes > DOWNLOAD_CHUNK_SIZE * 2) {
+    await downloadParallel(totalBytes);
+  } else {
+    await downloadSingle(totalBytes);
+  }
 
   const size = fs.statSync(INPUT_FILE).size;
   log(`Downloaded: ${(size / 1024 / 1024).toFixed(1)} MB`);
   updateProgress({ phase: "downloading", percent: 100, speed: null, eta: 0, detail: `${(size / 1024 / 1024).toFixed(1)} MB downloaded` });
   await sendProgress(true);
   return size;
+}
+
+async function downloadSingle(totalBytes) {
+  log("Downloading (single stream)...");
+  updateProgress({ phase: "downloading", percent: 0, detail: "Downloading..." });
+
+  const resp = await axios.get(SOURCE_URL, {
+    responseType: "stream", timeout: 600000, maxRedirects: 5
+  });
+
+  if (!totalBytes) totalBytes = parseInt(resp.headers["content-length"] || "0", 10);
+  let downloadedBytes = 0;
+  let lastSpeedCheck = Date.now();
+  let lastSpeedBytes = 0;
+  const writer = fs.createWriteStream(INPUT_FILE);
+
+  resp.data.on("data", (chunk) => {
+    downloadedBytes += chunk.length;
+    const now = Date.now();
+    const elapsed = (now - lastSpeedCheck) / 1000;
+    if (elapsed >= 1) {
+      const speed = (downloadedBytes - lastSpeedBytes) / elapsed;
+      const remaining = totalBytes > 0 ? (totalBytes - downloadedBytes) / speed : null;
+      const pct = totalBytes > 0 ? Math.min(99, (downloadedBytes / totalBytes) * 100) : 0;
+      updateProgress({
+        phase: "downloading", percent: Math.round(pct * 10) / 10,
+        speed: Math.round(speed),
+        eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
+        detail: `${(downloadedBytes / 1024 / 1024).toFixed(1)} / ${totalBytes > 0 ? (totalBytes / 1024 / 1024).toFixed(1) + " MB" : "?"}`
+      });
+      lastSpeedCheck = now; lastSpeedBytes = downloadedBytes;
+    }
+  });
+
+  resp.data.pipe(writer);
+  await new Promise((resolve, reject) => {
+    writer.on("finish", resolve);
+    writer.on("error", reject);
+    resp.data.on("error", reject);
+  });
+}
+
+async function downloadParallel(totalBytes) {
+  // Split into chunks
+  const chunks = [];
+  for (let start = 0; start < totalBytes; start += DOWNLOAD_CHUNK_SIZE) {
+    const end = Math.min(start + DOWNLOAD_CHUNK_SIZE - 1, totalBytes - 1);
+    chunks.push({ index: chunks.length, start, end });
+  }
+
+  log(`Parallel download: ${chunks.length} chunks × ${(DOWNLOAD_CHUNK_SIZE / 1024 / 1024).toFixed(0)} MB, ${PARALLEL_DOWNLOAD_CHUNKS} threads`);
+  updateProgress({ phase: "downloading", percent: 0, detail: `0/${chunks.length} chunks (${PARALLEL_DOWNLOAD_CHUNKS} threads)` });
+
+  // Pre-allocate the file
+  const fd = fs.openSync(INPUT_FILE, "w");
+  fs.ftruncateSync(fd, totalBytes);
+  fs.closeSync(fd);
+
+  let completedChunks = 0;
+  let downloadedBytes = 0;
+  const downloadStart = Date.now();
+
+  async function downloadChunk(chunk) {
+    const resp = await axios.get(SOURCE_URL, {
+      responseType: "arraybuffer",
+      timeout: 300000,
+      maxRedirects: 5,
+      headers: { Range: `bytes=${chunk.start}-${chunk.end}` }
+    });
+
+    // Write at exact offset
+    const chunkFd = fs.openSync(INPUT_FILE, "r+");
+    fs.writeSync(chunkFd, Buffer.from(resp.data), 0, resp.data.byteLength, chunk.start);
+    fs.closeSync(chunkFd);
+
+    completedChunks++;
+    downloadedBytes += resp.data.byteLength;
+
+    const elapsedSec = (Date.now() - downloadStart) / 1000;
+    const speed = elapsedSec > 0 ? downloadedBytes / elapsedSec : 0;
+    const remaining = speed > 0 ? (totalBytes - downloadedBytes) / speed : null;
+    const pct = Math.min(99, (downloadedBytes / totalBytes) * 100);
+
+    updateProgress({
+      phase: "downloading",
+      percent: Math.round(pct * 10) / 10,
+      speed: Math.round(speed),
+      eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
+      detail: `${completedChunks}/${chunks.length} chunks (${(downloadedBytes / 1024 / 1024).toFixed(1)} MB)`
+    });
+  }
+
+  // Parallel execution with concurrency limit
+  const queue = [...chunks];
+  const active = new Set();
+
+  while (queue.length > 0 || active.size > 0) {
+    while (active.size < PARALLEL_DOWNLOAD_CHUNKS && queue.length > 0) {
+      const chunk = queue.shift();
+      const p = downloadChunk(chunk).catch(err => {
+        log(`  Retry chunk ${chunk.index} (${err.message.slice(0, 60)})`);
+        return downloadChunk(chunk);
+      });
+      active.add(p);
+      p.finally(() => active.delete(p));
+    }
+    if (active.size > 0) await Promise.race([...active]);
+  }
 }
 
 // ─── Step 2: FFmpeg encode to H.264 540p HLS ─────────
