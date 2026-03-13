@@ -336,40 +336,35 @@ const sbHeaders = () => ({
 async function getOrCreateCategoryFolder() {
   // Category folder name: "Movies" or "Series"
   const categoryName = CATEGORY === "series" ? "Series" : "Movies";
+  const parentId = SB_PARENT || null;
 
-  if (!SB_PARENT) {
-    // No parent folder configured — just create the category folder at root
-    log(`Creating category folder: ${categoryName} (no parent)`);
-    const resp = await axios.post(`${SB_API}/folders`, { name: categoryName }, {
-      headers: sbHeaders(), timeout: 15000
-    });
-    return String(resp.data?.folder?.id || resp.data?.id || resp.data?.data?.id);
-  }
-
-  // List children of parent to find existing category folder
+  // Search for existing folder (at root or under parent)
   try {
-    const resp = await axios.get(`${SB_API}/folders/${SB_PARENT}/children`, {
-      headers: sbHeaders(), timeout: 15000
+    const params = { per_page: 100 };
+    if (parentId) params.parentIds = parentId;
+    const resp = await axios.get(`${SB_API}/drive/file-entries`, {
+      headers: sbHeaders(), params, timeout: 15000
     });
-    const children = resp.data?.children || resp.data?.folders || resp.data?.data || [];
-    const existing = children.find(f =>
-      (f.name || "").toLowerCase() === categoryName.toLowerCase()
+    const entries = resp.data?.data || [];
+    const existing = entries.find(f =>
+      f.type === "folder" && (f.name || "").toLowerCase() === categoryName.toLowerCase()
     );
     if (existing) {
-      const id = String(existing.id);
-      log(`Found existing "${categoryName}" folder: ${id}`);
-      return id;
+      log(`Found existing "${categoryName}" folder: ${existing.id}`);
+      return String(existing.id);
     }
   } catch (err) {
-    log(`Could not list parent folder children: ${err.message} — will create anyway`);
+    log(`Could not list existing folders: ${err.message} — will try creating`);
   }
 
-  // Create category subfolder under parent
-  log(`Creating "${categoryName}" folder under parent ${SB_PARENT}`);
-  const resp = await axios.post(`${SB_API}/folders`, {
-    name: categoryName,
-    parentId: String(SB_PARENT)
-  }, { headers: sbHeaders(), timeout: 15000 });
+  // Create the category folder
+  const body = { name: categoryName };
+  if (parentId) body.parentId = String(parentId);
+  log(`Creating "${categoryName}" folder${parentId ? ` under parent ${parentId}` : " at root"}`);
+
+  const resp = await axios.post(`${SB_API}/folders`, body, {
+    headers: sbHeaders(), timeout: 15000
+  });
 
   const id = resp.data?.folder?.id || resp.data?.id || resp.data?.data?.id;
   if (!id) throw new Error(`Failed to create ${categoryName} folder: ${JSON.stringify(resp.data).slice(0, 300)}`);
