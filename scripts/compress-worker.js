@@ -35,6 +35,7 @@ const SOURCE_URL = process.env.SOURCE_URL;
 const CALLBACK_URL = process.env.CALLBACK_URL;
 const PROGRESS_URL = process.env.PROGRESS_URL;
 const CATEGORY = (process.env.CATEGORY || "movie").toLowerCase();
+const AUDIO_LANGUAGE = (process.env.AUDIO_LANGUAGE || "").trim();
 
 const SB_API = "https://spacebyte.in/api/v1";
 const TEMP_DIR = "/tmp/compress";
@@ -233,17 +234,49 @@ async function encodeHLS() {
   updateProgress({ phase: "converting", percent: 0, speed: null, eta: null, detail: "Probing input..." });
   await sendProgress(true);
 
-  // Probe input for duration and resolution
+  // Probe input for duration, resolution, and audio streams
   let duration = 0;
   let inputHeight = 0;
+  let audioStreams = [];
   try {
     const probe = execSync(`ffprobe -v error -show_streams -show_format -of json "${INPUT_FILE}"`, { timeout: 30000 }).toString();
     const info = JSON.parse(probe);
     const video = info.streams?.find(s => s.codec_type === "video");
     duration = parseFloat(info.format?.duration || "0");
     inputHeight = parseInt(video?.height || "0", 10);
+    audioStreams = (info.streams || []).filter(s => s.codec_type === "audio").map((s, i) => ({
+      index: s.index,
+      lang: (s.tags?.language || "").toLowerCase(),
+      title: (s.tags?.title || "").toLowerCase(),
+      channels: s.channels || 0,
+      order: i
+    }));
     if (video) log(`Input: ${video.width}x${video.height} ${video.codec_name} duration=${Math.round(duration)}s`);
+    if (audioStreams.length > 1) log(`Audio streams: ${audioStreams.map(a => `#${a.index} lang=${a.lang} title=${a.title} ch=${a.channels}`).join(", ")}`);
   } catch (_) { /* non-fatal */ }
+
+  // Select the best audio stream matching the requested language
+  let audioMapArgs = [];
+  if (AUDIO_LANGUAGE && audioStreams.length > 1) {
+    const lang = AUDIO_LANGUAGE.toLowerCase();
+    // Map common language names to ISO 639 codes
+    const langCodes = {
+      english: ["eng", "en"], hindi: ["hin", "hi"], telugu: ["tel", "te"],
+      tamil: ["tam", "ta"], kannada: ["kan", "kn"], malayalam: ["mal", "ml"],
+      korean: ["kor", "ko"], japanese: ["jpn", "ja"]
+    };
+    const codes = langCodes[lang] || [lang];
+    const allCodes = [lang, ...codes];
+
+    // Match by language tag or title
+    let match = audioStreams.find(a => allCodes.includes(a.lang) || allCodes.some(c => a.title.includes(c)));
+    if (match) {
+      audioMapArgs = ["-map", "0:v:0", "-map", `0:${match.index}`];
+      log(`Selected audio stream #${match.index} (lang=${match.lang}, title=${match.title}) for ${AUDIO_LANGUAGE}`);
+    } else {
+      log(`WARNING: No audio stream matching "${AUDIO_LANGUAGE}" found, using first audio track`);
+    }
+  }
 
   // Choose output height: cap at 480p, keep original if already smaller
   const targetHeight = Math.min(480, inputHeight || 480);
@@ -251,6 +284,7 @@ async function encodeHLS() {
   const manifestPath = path.join(HLS_DIR, "index.m3u8");
   const args = [
     "-y", "-i", INPUT_FILE,
+    ...audioMapArgs,
     "-c:v", "libx265",
     "-crf", "28",
     "-preset", "slow",
