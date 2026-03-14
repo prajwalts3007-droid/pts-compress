@@ -429,7 +429,9 @@ async function uploadToSpaceByte(hlsFiles) {
 
   const fileMap = {};
   let uploaded = 0;
-  const SB_PARALLEL = 5;
+  let totalUploadedBytes = 0;
+  const totalUploadSize = hlsFiles.reduce((sum, f) => sum + fs.statSync(path.join(HLS_DIR, f)).size, 0);
+  const uploadStartTime = Date.now();
 
   async function uploadOne(fileName) {
     const filePath = path.join(HLS_DIR, fileName);
@@ -461,18 +463,24 @@ async function uploadToSpaceByte(hlsFiles) {
     const id = entry.data?.fileEntry?.id;
     if (id) fileMap[fileName] = String(id);
     uploaded++;
+    totalUploadedBytes += fileData.length;
     const pct = (uploaded / hlsFiles.length) * 100;
+    const elapsedSec = (Date.now() - uploadStartTime) / 1000;
+    const speed = elapsedSec > 0 ? totalUploadedBytes / elapsedSec : 0;
+    const remaining = speed > 0 ? (totalUploadSize - totalUploadedBytes) / speed : null;
     updateProgress({
       phase: "uploading",
       percent: Math.round(pct * 10) / 10,
-      detail: `SpaceByte: ${uploaded}/${hlsFiles.length}`
+      speed: Math.round(speed),
+      eta: remaining != null && Number.isFinite(remaining) ? Math.round(remaining) : null,
+      detail: `${uploaded}/${hlsFiles.length} files (${(totalUploadedBytes / 1024 / 1024).toFixed(1)} / ${(totalUploadSize / 1024 / 1024).toFixed(1)} MB)`
     });
   }
 
   const queue = [...hlsFiles];
   const active = new Set();
   while (queue.length > 0 || active.size > 0) {
-    while (active.size < SB_PARALLEL && queue.length > 0) {
+    while (active.size < PARALLEL_UPLOADS && queue.length > 0) {
       const fileName = queue.shift();
       const p = uploadOne(fileName).catch(err => {
         log(`  Retry SB: ${fileName} (${err.message.slice(0, 80)})`);
