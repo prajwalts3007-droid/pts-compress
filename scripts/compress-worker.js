@@ -42,7 +42,7 @@ const TEMP_DIR = "/tmp/compress";
 const INPUT_FILE = path.join(TEMP_DIR, "input.mp4");
 const HLS_DIR = path.join(TEMP_DIR, "hls");
 
-const PARALLEL_UPLOADS = 15;
+const PARALLEL_UPLOADS = 30;
 const PARALLEL_DOWNLOAD_CHUNKS = 8;
 const DOWNLOAD_CHUNK_SIZE = 10 * 1024 * 1024; // 10 MB per chunk
 const PROGRESS_INTERVAL = 1000; // 1 second
